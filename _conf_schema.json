@@ -1,0 +1,27 @@
+{
+  "enabled": {
+    "description": "是否启用空 @ / 只唤醒的接管与唤醒词补回。",
+    "type": "bool",
+    "default": true
+  },
+  "wait_seconds": {
+    "description": "接话后继续等待同一个人下一条消息的秒数。默认六十秒，和框架原来的等待一致。",
+    "type": "int",
+    "default": 60
+  },
+  "at_fallback_name": {
+    "description": "单独 @ 时如果消息里没有机器人昵称，用这个称呼代替，拼成“@称呼”交给模型。",
+    "type": "string",
+    "default": "机器人"
+  },
+  "empty_at_keep_at": {
+    "description": "只 @ 时交给模型的文本是否保留 @ 符号。开启时模型看到“@召唤”；关闭时只看到“召唤”。带内容的消息不受影响，正常 @ 仍然会去掉。",
+    "type": "bool",
+    "default": true
+  },
+  "restore_wake_word": {
+    "description": "带内容的唤醒词是否补回消息里。开启后“为什么天空是蓝的”不会变成“天空是蓝的”；命令消息不受影响。",
+    "type": "bool",
+    "default": true
+  }
+}
