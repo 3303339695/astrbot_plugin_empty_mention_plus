@@ -1,22 +1,22 @@
-"""空 @ 接话：保留唤醒词，并把 @ / 唤醒词本身交给模型。
+"""空 @ 接话：保留唤醒词，让空 @ 走正常上下文。
 
 框架的唤醒检查阶段会剪掉消息开头的唤醒词；内置的空 @ 处理又会把
-“只 @”换成一段固定提示词，然后等用户下一条消息。
+“只 @”换成一段固定提示词，并且不把正常对话上下文交给模型。
 
 这个插件在唤醒检查之后、内置空 @ 处理之前运行：
 
 - 带内容的唤醒词：把被剪掉的唤醒词补回消息，避免“为什么”这类词被吃掉；
-- 只 @：只把“@机器人”本身交给模型，正常回一句；
-- 只唤醒：只把唤醒词本身交给模型，正常回一句；
+- 只 @ / 只唤醒：把这条消息重新摆成“@ + 一句话”的普通形状，让正常
+  流程带着完整上下文去回复；不会塞固定提示词；
 - 带 @ 的正常内容：照旧去掉 @，不额外处理；
 - 命令：完全不碰，避免指令被补回的唤醒词影响。
 
-空 @ / 只唤醒回答完后，仍然保留原来的等待时间；等待只认刚才那个人，
-不会翻上一条旧消息，避免把不相关的话题接进来。
+空 @ / 只唤醒回复完后，仍然保留原来的等待时间；等待只认刚才那个人。
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from sys import maxsize
 
@@ -42,9 +42,9 @@ class _SenderSessionFilter(SessionFilter):
 
 @register(
     "astrbot_plugin_empty_mention_plus",
-    "本地补丁",
-    "空 @ 或只唤醒时只把 @ / 唤醒词本身交给模型，并保留等待",
-    "1.1.0",
+    "大肥鱼、coalblock666710",
+    "空 @ 或只唤醒时保留完整上下文，并补回被剪掉的唤醒词",
+    "1.3.0",
 )
 class EmptyMentionPlus(Star):
     def __init__(self, context: Context, config=None) -> None:
@@ -81,10 +81,7 @@ class EmptyMentionPlus(Star):
 
     @staticmethod
     def _has_command_handler(event: AstrMessageEvent) -> bool:
-        """当前消息是否已经被某个指令处理器接管。
-
-        指令依赖被剪掉唤醒词后的文本，所以补回唤醒词之前必须先避开指令。
-        """
+        """当前消息是否已经被某个指令处理器接管。"""
         try:
             handlers = event.get_extra("activated_handlers") or []
         except Exception:
@@ -121,11 +118,7 @@ class EmptyMentionPlus(Star):
         messages: list,
         wake_prefixes: list[str],
     ) -> None:
-        """把唤醒检查阶段剪掉的唤醒词补回消息文本。
-
-        只在“原始文本以唤醒词开头，并且当前文本正好是剪掉后的剩余部分”
-        时补回，避免误改已经被别的处理器改过的消息。
-        """
+        """把唤醒检查阶段剪掉的唤醒词补回消息文本。"""
         if not self._cfg("restore_wake_word", True):
             return
         original = self._plain_text(messages)
@@ -189,35 +182,6 @@ class EmptyMentionPlus(Star):
 
         return None
 
-    # ------------------------------------------------------------ 对话与等待
-
-    async def _get_conversation(self, event: AstrMessageEvent):
-        """拿当前对话，主要为了让模型仍然使用原来的人格。"""
-        try:
-            manager = self.context.conversation_manager
-            curr_cid = await manager.get_curr_conversation_id(
-                event.unified_msg_origin,
-            )
-            conversation = None
-            if curr_cid:
-                conversation = await manager.get_conversation(
-                    event.unified_msg_origin,
-                    curr_cid,
-                )
-            if conversation is None:
-                curr_cid = await manager.new_conversation(
-                    event.unified_msg_origin,
-                    platform_id=event.get_platform_id(),
-                )
-                conversation = await manager.get_conversation(
-                    event.unified_msg_origin,
-                    curr_cid,
-                )
-            return conversation, curr_cid
-        except Exception as exc:
-            self.logger.debug("读取对话失败，将由模型直接处理 @ 文本：%s", exc)
-            return None, None
-
     @staticmethod
     def _has_image(messages: list) -> bool:
         for message in messages:
@@ -233,6 +197,41 @@ class EmptyMentionPlus(Star):
         if not isinstance(prefixes, (list, tuple, set)):
             return []
         return [str(prefix).strip() for prefix in prefixes if str(prefix).strip()]
+
+    # ------------------------------------------------------------------ 等待
+
+    async def _wait_for_followup(self, event: AstrMessageEvent) -> None:
+        wait_seconds = self._int_cfg("wait_seconds", 60, 1, 300)
+
+        @session_waiter(wait_seconds)
+        async def empty_mention_waiter(
+            controller: SessionController,
+            next_event: AstrMessageEvent,
+        ) -> None:
+            text = (next_event.message_str or "").strip()
+            if not text and not self._has_image(next_event.get_messages()):
+                return
+            next_event.message_obj.message.insert(
+                0,
+                Comp.At(
+                    qq=next_event.get_self_id(),
+                    name=next_event.get_self_id(),
+                ),
+            )
+            new_event = copy.copy(next_event)
+            self.context.get_event_queue().put_nowait(new_event)
+            next_event.stop_event()
+            controller.stop()
+
+        try:
+            await empty_mention_waiter(
+                event,
+                session_filter=_SenderSessionFilter(),
+            )
+        except TimeoutError:
+            pass
+        except Exception:
+            self.logger.exception("空 @ 等待失败。")
 
     # ------------------------------------------------------------------ 主逻辑
 
@@ -251,13 +250,11 @@ class EmptyMentionPlus(Star):
         messages = event.get_messages()
 
         # 顺序很重要：先判断是不是空 @ / 只唤醒，再决定要不要裁 @。
-        # 空 @ 时走下面的接管；普通消息才补回被剪掉的唤醒词。
         raw_text = self._empty_text(event, messages, wake_prefixes)
         if raw_text is None:
             self._restore_wake_text(event, messages, wake_prefixes)
             return
 
-        # 已有等待会话时让内置的会话控制逻辑处理，避免叠两层等待。
         sender_session = f"{event.unified_msg_origin}:{event.get_sender_id()}"
         if (
             event.unified_msg_origin in USER_SESSIONS
@@ -265,57 +262,24 @@ class EmptyMentionPlus(Star):
         ):
             return
 
-        handled = False
-        try:
-            conversation, curr_cid = await self._get_conversation(event)
-            self.logger.debug(
-                "空 @ 接管：只把 %s 交给模型，等待 %s 秒",
-                raw_text,
-                self._int_cfg("wait_seconds", 60, 1, 300),
-            )
+        # 把空 @ / 只唤醒重新摆成“@ + 一句话”的普通消息形状：
+        # - 两个消息段可以绕开内置空 @ 处理；
+        # - message_str 直接是 @ 文本，正常流程会带着完整上下文回复。
+        event.message_str = raw_text
+        event.message_obj.message = [
+            Comp.At(
+                qq=event.get_self_id(),
+                name=event.get_self_id(),
+            ),
+            Comp.Plain(text=raw_text),
+        ]
 
-            handled = True
-            yield event.request_llm(
-                prompt=raw_text,
-                session_id=curr_cid or "",
-                contexts=[],
-                system_prompt="",
-                conversation=conversation,
-            )
+        self.logger.debug(
+            "空 @ 改为普通消息：%s，等待 %s 秒",
+            raw_text,
+            self._int_cfg("wait_seconds", 60, 1, 300),
+        )
 
-            wait_seconds = self._int_cfg("wait_seconds", 60, 1, 300)
-
-            @session_waiter(wait_seconds)
-            async def empty_mention_waiter(
-                controller: SessionController,
-                next_event: AstrMessageEvent,
-            ) -> None:
-                text = (next_event.message_str or "").strip()
-                if not text and not self._has_image(next_event.get_messages()):
-                    return
-                next_event.message_obj.message.insert(
-                    0,
-                    Comp.At(
-                        qq=next_event.get_self_id(),
-                        name=next_event.get_self_id(),
-                    ),
-                )
-                new_event = copy.copy(next_event)
-                self.context.get_event_queue().put_nowait(new_event)
-                next_event.stop_event()
-                controller.stop()
-
-            try:
-                await empty_mention_waiter(
-                    event,
-                    session_filter=_SenderSessionFilter(),
-                )
-            except TimeoutError:
-                pass
-            finally:
-                event.stop_event()
-        except Exception:
-            self.logger.exception("空 @ 接话失败。")
-            if handled:
-                # 已经接管过就不能再把事件交给内置空 @ 流程，否则会重复回复。
-                event.stop_event()
+        asyncio.create_task(self._wait_for_followup(event))
+        # 让等待任务先注册，再交回正常流程去带完整上下文请求模型。
+        await asyncio.sleep(0)
